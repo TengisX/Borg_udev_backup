@@ -1,0 +1,12 @@
+*-mode:org;mode:visual-line;mode:org-cdlatex;mode:org-num;org-latex-prefer-user-labels:t;mode:org-transclusion;-*-
+:settings:
+#+STARTUP: showall indent inlineimages latexpreview
+:end:
+#+title:Creating and using a plug-in offline backup with borg
+#+subtitle:Backup will begin, as soon as the device is plugged in. 
+* List of scripts
+- Install device :: [[file:install-auto-backup.sh]]
+- Setup borg and udev :: [[file:borg-setup.sh]]
+- Controls during long backup process :: [[file:usb-backup.sh]]
+Usage instruction will be described automatically with the script.
+
