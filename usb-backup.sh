@@ -7,7 +7,9 @@ SERVICE=borgmatic-usb
 CONF=/etc/borgmatic.d/usb-backup.yaml
 RULE=/etc/udev/rules.d/99-borgmatic-usb.rules
 PASSFILE=/root/.config/borg/passphrase
-SIZE_CACHE=/var/cache/usb-backup/source-size
+CACHE_DIR=/var/cache/usb-backup
+FILE_LIST=$CACHE_DIR/files.list   # source files in the order borg reads them, NUL-separated
+FILE_STATS=$CACHE_DIR/files.stats # source path, then "<file count> <total bytes>"
 
 usage() {
   cat <<'EOF'
@@ -97,26 +99,83 @@ borg_pid() {
   done < "$procs"
 }
 
-# Total size of the source in bytes; du over 5 TB is slow, so the result is cached for a day
-source_size() {
-  local size
-  if [[ -f $SIZE_CACHE ]] && [[ -n $(find "$SIZE_CACHE" -mmin -1440) ]] \
-     && [[ $(head -n1 "$SIZE_CACHE") == "$SRC" ]]; then
-    tail -n1 "$SIZE_CACHE"; return
+# Write the source's regular files to $FILE_LIST in the order borg reads them (depth-first,
+# each directory sorted by inode number like borg's scandir_inorder, skipping the
+# exclude_patterns) and print "<file count> <total bytes>". Walking 5 TB is slow, so the
+# result is cached for a day.
+source_stats() {
+  local stats
+  if [[ -f $FILE_LIST && -f $FILE_STATS ]] && [[ -n $(find "$FILE_STATS" -mmin -1440) ]] \
+     && [[ $(head -n1 "$FILE_STATS") == "$SRC" ]]; then
+    tail -n1 "$FILE_STATS"; return
   fi
-  echo "Measuring the size of $SRC (only the first time, may take a few minutes)..." >&2
-  size=$(ionice -c3 nice du -sb "$SRC" 2>/dev/null | cut -f1 || true)
-  [[ -n $size ]] || return 0
-  mkdir -p "$(dirname "$SIZE_CACHE")"
-  printf '%s\n%s\n' "$SRC" "$size" > "$SIZE_CACHE"
-  echo "$size"
+  echo "Listing the files in $SRC (once a day, may take a few minutes)..." >&2
+  mkdir -p "$CACHE_DIR"
+  stats=$(ionice -c3 nice python3 - "$SRC" "$CONF" "$FILE_LIST" <<'PY'
+import fnmatch, os, sys
+
+src, conf, out_path = sys.argv[1:4]
+
+# exclude_patterns from the config: the "- '<pattern>'" lines after the key
+excludes = []
+with open(conf) as f:
+    inside = False
+    for line in f:
+        if line.startswith('exclude_patterns:'):
+            inside = True
+            continue
+        if inside:
+            s = line.strip()
+            if not s.startswith('- '):
+                break
+            p = s[2:].strip()
+            if p[:1] == "'":
+                p = p[1:-1].replace("''", "'")
+            elif p[:1] == '"':
+                p = p[1:-1]
+            excludes.append(os.fsencode(p[3:] if p.startswith('fm:') else p))
+
+count = size = 0
+
+def walk(path, out):
+    global count, size
+    try:
+        entries = sorted(os.scandir(path), key=lambda e: e.inode())
+    except OSError:
+        return
+    for e in entries:
+        if any(fnmatch.fnmatchcase(e.path, x) for x in excludes):
+            continue
+        try:
+            if e.is_dir(follow_symlinks=False):
+                walk(e.path, out)
+            elif e.is_file(follow_symlinks=False):
+                out.write(e.path + b'\0')
+                count += 1
+                size += e.stat(follow_symlinks=False).st_size
+        except OSError:
+            pass
+
+with open(out_path + '.tmp', 'wb') as out:
+    walk(os.fsencode(src), out)
+os.replace(out_path + '.tmp', out_path)
+print(count, size)
+PY
+  ) || return 0
+  printf '%s\n%s\n' "$SRC" "$stats" > "$FILE_STATS"
+  echo "$stats"
+}
+
+# Position (1-based) of a file in $FILE_LIST, empty if it is not in there
+file_index() {
+  grep -zxnF -m1 -- "$1" "$FILE_LIST" 2>/dev/null | cut -zd: -f1 | tr -d '\0' || true
 }
 
 cmd_progress() {
-  local pid total elapsed read1 read2 sample=10 now avg left eta f files=()
+  local pid nfiles total elapsed read1 read2 sample=10 now avg left eta f files=() idx=""
   pid=$(borg_pid)
   [[ -n $pid ]] || { echo "No backup is running."; exit 0; }
-  total=$(source_size)
+  read -r nfiles total <<< "$(source_stats)"
 
   echo "Measuring speed (${sample}s)..." >&2
   read1=$(awk '/^rchar:/ {print $2}' "/proc/$pid/io")
@@ -132,21 +191,25 @@ cmd_progress() {
     f=$(readlink "$f" 2>/dev/null) || continue
     if [[ $f == "$SRC"/* ]]; then files+=("$f"); fi
   done
+  # Where that file sits in borg's reading order tells how many files are done
+  if [[ ${#files[@]} -gt 0 && -n $nfiles ]]; then idx=$(file_index "${files[-1]}"); fi
 
   echo "Backup PID:    $pid (running $(duration "$elapsed"))"
-  if [[ -n $total && $total -gt 0 ]]; then
-    echo "Source:        $SRC ($(human "$total"))"
-    echo "Read so far:   $(human "$read2") / $(human "$total") ($(awk -v r="$read2" -v t="$total" 'BEGIN {printf "%.1f%%", r*100/t}'))"
+  if [[ -n $nfiles ]]; then
+    echo "Source:        $SRC ($nfiles files, $(human "$total"))"
   else
-    echo "Source:        $SRC (size unknown)"
-    echo "Read so far:   $(human "$read2")"
+    echo "Source:        $SRC (file count unknown)"
   fi
-  echo "Speed:         now $(human "$now")/s, average $(human "$avg")/s"
-  if [[ -n $total && $avg -gt 0 ]]; then
-    left=$(( total > read2 ? total - read2 : 0 ))
-    eta=$(( left / avg ))
+  if [[ -n $idx ]]; then
+    echo "Files done:    $idx / $nfiles ($(awk -v i="$idx" -v n="$nfiles" 'BEGIN {printf "%.1f%%", i*100/n}'))"
+    left=$(( nfiles > idx ? nfiles - idx : 0 ))
+    eta=$(( left * elapsed / idx ))
     echo "ETA:           ~$(duration "$eta") (around $(date -d "+$eta sec" '+%Y-%m-%d %H:%M'))"
+  elif [[ -n $nfiles ]]; then
+    echo "Files done:    unknown right now (borg is not reading a listed file, try again)"
   fi
+  echo "Read so far:   $(human "$read2")"
+  echo "Speed:         now $(human "$now")/s, average $(human "$avg")/s"
   if [[ ${#files[@]} -gt 0 ]]; then
     printf 'Current file:  %s\n' "${files[@]}"
   fi
@@ -154,8 +217,8 @@ cmd_progress() {
     df -h --output=used,avail "$MNT" | awk 'NR==2 {print "Backup drive:  used " $1 ", free " $2}'
   fi
   echo
-  echo "Note: the percentage is only accurate for the first (full) backup. Later backups"
-  echo "skip unchanged files, so they finish long before 'read' reaches the total."
+  echo "Note: the ETA assumes every file takes about as long as the ones so far, so it"
+  echo "jumps around when borg reaches a run of very large or very small files."
 }
 
 cmd_log() {
